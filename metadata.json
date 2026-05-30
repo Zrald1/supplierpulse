@@ -1,0 +1,6 @@
+{
+  "name": "SupplierPulse",
+  "description": "Live Vendor Risk & Opportunity Intelligence Agent offering real-time scraping, classification, and vendor analysis.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
