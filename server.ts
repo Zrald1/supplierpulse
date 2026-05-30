@@ -27,8 +27,7 @@ app.get('/api/health', (req, res) => {
 app.all('/api/test-keys', async (req, res) => {
   try {
     const custom_aiml_key = req.body?.custom_aiml_key || req.query?.custom_aiml_key || req.body?.custom_vultr_key || req.query?.custom_vultr_key;
-    const custom_gemini_key = req.body?.custom_gemini_key || req.query?.custom_gemini_key;
-    const results = await testAllKeys(custom_aiml_key as string, custom_gemini_key as string);
+    const results = await testAllKeys(custom_aiml_key as string);
     res.json({ results });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Key diagnosis trial failed' });
@@ -75,7 +74,7 @@ app.get('/api/vendors', (req, res) => {
 // 3. Trigger Active Vendor Analysis
 app.post('/api/analyze', async (req, res) => {
   try {
-    const { company_name, ai_mode, custom_gemini_key, custom_brightdata_key, custom_aiml_key, custom_vultr_key } = req.body;
+    const { company_name, ai_mode, custom_brightdata_key, custom_aiml_key, custom_vultr_key } = req.body;
     if (!company_name || typeof company_name !== 'string' || !company_name.trim()) {
       return res.status(400).json({ error: 'Vendor parameter "company_name" is required' });
     }
@@ -93,7 +92,7 @@ app.post('/api/analyze', async (req, res) => {
     
     // We execute runAgentPipeline asynchronously in the background. It will update the DB and emit search events.
     const active_aiml_key = custom_aiml_key || custom_vultr_key;
-    runAgentPipeline(job.id, cleanInput, ai_mode, custom_gemini_key, custom_brightdata_key, active_aiml_key).catch(err => {
+    runAgentPipeline(job.id, cleanInput, ai_mode, custom_brightdata_key, active_aiml_key).catch(err => {
       console.error(`Pipeline failure for job ${job.id}:`, err);
     });
 

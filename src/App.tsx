@@ -522,7 +522,6 @@ export default function App() {
   const [customBrightDataApiKey, setCustomBrightDataApiKey] = useState<string>(() => localStorage.getItem('custom_brightdata_api_key') || '');
   const [customSlackWebhookUrl, setCustomSlackWebhookUrl] = useState<string>(() => localStorage.getItem('custom_slack_webhook_url') || '');
   const [customAimlApiKey, setCustomAimlApiKey] = useState<string>(() => localStorage.getItem('custom_aiml_api_key') || localStorage.getItem('custom_vultr_api_key') || '');
-  const [customGeminiApiKey, setCustomGeminiApiKey] = useState<string>(() => localStorage.getItem('custom_gemini_api_key') || '');
   const [customTelegramBotToken, setCustomTelegramBotToken] = useState<string>(() => localStorage.getItem('custom_telegram_bot_token') || '');
   const [customTelegramChatId, setCustomTelegramChatId] = useState<string>(() => localStorage.getItem('custom_telegram_chat_id') || '');
 
@@ -537,7 +536,6 @@ export default function App() {
   const [tempBrightDataKey, setTempBrightDataKey] = useState(customBrightDataApiKey);
   const [tempSlackWebhook, setTempSlackWebhook] = useState(customSlackWebhookUrl);
   const [tempAimlKey, setTempAimlKey] = useState(customAimlApiKey);
-  const [tempGeminiKey, setTempGeminiKey] = useState(customGeminiApiKey);
   const [tempTelegramBotToken, setTempTelegramBotToken] = useState(customTelegramBotToken);
   const [tempTelegramChatId, setTempTelegramChatId] = useState(customTelegramChatId);
 
@@ -547,17 +545,15 @@ export default function App() {
       setTempBrightDataKey(customBrightDataApiKey);
       setTempSlackWebhook(customSlackWebhookUrl);
       setTempAimlKey(customAimlApiKey);
-      setTempGeminiKey(customGeminiApiKey);
       setTempTelegramBotToken(customTelegramBotToken);
       setTempTelegramChatId(customTelegramChatId);
     }
-  }, [showConfigModal, customBrightDataApiKey, customSlackWebhookUrl, customAimlApiKey, customGeminiApiKey, customTelegramBotToken, customTelegramChatId]);
+  }, [showConfigModal, customBrightDataApiKey, customSlackWebhookUrl, customAimlApiKey, customTelegramBotToken, customTelegramChatId]);
 
   const handleSaveCredentials = () => {
     localStorage.setItem('custom_brightdata_api_key', tempBrightDataKey);
     localStorage.setItem('custom_slack_webhook_url', tempSlackWebhook);
     localStorage.setItem('custom_aiml_api_key', tempAimlKey);
-    localStorage.setItem('custom_gemini_api_key', tempGeminiKey);
     // clean vintage key identifier to prevent overlap and 401s
     localStorage.removeItem('custom_vultr_api_key');
     localStorage.setItem('custom_telegram_bot_token', tempTelegramBotToken);
@@ -566,7 +562,6 @@ export default function App() {
     setCustomBrightDataApiKey(tempBrightDataKey);
     setCustomSlackWebhookUrl(tempSlackWebhook);
     setCustomAimlApiKey(tempAimlKey);
-    setCustomGeminiApiKey(tempGeminiKey);
     setCustomTelegramBotToken(tempTelegramBotToken);
     setCustomTelegramChatId(tempTelegramChatId);
     
@@ -578,7 +573,6 @@ export default function App() {
     localStorage.removeItem('custom_brightdata_api_key');
     localStorage.removeItem('custom_slack_webhook_url');
     localStorage.removeItem('custom_aiml_api_key');
-    localStorage.removeItem('custom_gemini_api_key');
     localStorage.removeItem('custom_vultr_api_key');
     localStorage.removeItem('custom_telegram_bot_token');
     localStorage.removeItem('custom_telegram_chat_id');
@@ -586,14 +580,12 @@ export default function App() {
     setCustomBrightDataApiKey('');
     setCustomSlackWebhookUrl('');
     setCustomAimlApiKey('');
-    setCustomGeminiApiKey('');
     setCustomTelegramBotToken('');
     setCustomTelegramChatId('');
     
     setTempBrightDataKey('');
     setTempSlackWebhook('');
     setTempAimlKey('');
-    setTempGeminiKey('');
     setTempTelegramBotToken('');
     setTempTelegramChatId('');
     
@@ -725,16 +717,21 @@ export default function App() {
   };
 
   const diagnoseGlobalApiKeys = async () => {
+    setShowKeyDiagnosis(true);
+    if (!customAimlApiKey) {
+      setKeyStatusResults([
+        { index: 0, preview: '—', is_ok: false, display: 'No AIML API key configured. Add one in Configure.' }
+      ]);
+      return;
+    }
     setIsTestingKeys(true);
     setKeyStatusResults(null);
-    setShowKeyDiagnosis(true);
     try {
       const response = await fetch('/api/test-keys', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
-          custom_aiml_key: customAimlApiKey || undefined,
-          custom_gemini_key: customGeminiApiKey || undefined
+          custom_aiml_key: customAimlApiKey || undefined
         })
       });
       if (response.ok) {
@@ -814,8 +811,7 @@ export default function App() {
           company_name: companyName, 
           ai_mode: aiMode,
           custom_brightdata_key: customBrightDataApiKey || undefined,
-          custom_aiml_key: customAimlApiKey || undefined,
-          custom_gemini_key: customGeminiApiKey || undefined
+          custom_aiml_key: customAimlApiKey || undefined
         })
       });
 
@@ -2615,25 +2611,10 @@ export default function App() {
                 />
               </div>
 
-              {/* GOOGLE GEMINI API KEY SECTION */}
-              <div className="flex flex-col gap-1">
-                <label className="font-bold flex justify-between">
-                  <span>4. GOOGLE GEMINI API KEY</span>
-                  <span className="text-[9px] opacity-60 font-normal">Google Search Grounding & fallback logic</span>
-                </label>
-                <input
-                  type="password"
-                  placeholder="Paste your Google Gemini API Key..."
-                  value={tempGeminiKey}
-                  onChange={(e) => setTempGeminiKey(e.target.value)}
-                  className="bg-[#DCDAD7]/40 border border-[#141414] text-xs px-3 py-1.5 outline-none rounded shadow-[inset_1px_1px_2px_rgba(0,0,0,0.1)] focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 w-full"
-                />
-              </div>
-
               {/* TELEGRAM BOT API TOKEN */}
               <div className="flex flex-col gap-1">
                 <label className="font-bold flex justify-between">
-                  <span>5. TELEGRAM BOT TOKEN</span>
+                  <span>4. TELEGRAM BOT TOKEN</span>
                   <span className="text-[9px] opacity-60 font-normal">Client-Side Bot Token</span>
                 </label>
                 <input
@@ -2648,7 +2629,7 @@ export default function App() {
               {/* TELEGRAM CHAT ID */}
               <div className="flex flex-col gap-1">
                 <label className="font-bold flex justify-between">
-                  <span>6. TELEGRAM CHAT ID</span>
+                  <span>5. TELEGRAM CHAT ID</span>
                   <span className="text-[9px] opacity-60 font-normal">Chat or Channel Target Channel ID</span>
                 </label>
                 <input
@@ -2754,12 +2735,11 @@ export default function App() {
             <span>Status: {isScraping ? 'Agent Active' : 'Agent Idle'}</span>
           </span>
           <span className="hidden sm:inline">Refresh: Live on Demands</span>
-          <span className="hidden md:inline">Grounding: Google Search Enabled</span>
+          <span className="hidden md:inline">Inference: AIML API</span>
         </div>
         <div className="flex gap-6 shrink-0">
           <span>BRIGHTDATA: {customBrightDataApiKey ? 'CLIENT OVERRIDE' : 'SYSTEM READY'}</span>
           <span>AIML API: {customAimlApiKey ? 'CLIENT OVERRIDE' : 'SYSTEM READY'}</span>
-          <span>GEMINI: {customGeminiApiKey ? 'CLIENT OVERRIDE' : 'SYSTEM READY'}</span>
           <span className="hidden sm:inline uppercase">LLM: {aiMode}</span>
         </div>
       </footer>

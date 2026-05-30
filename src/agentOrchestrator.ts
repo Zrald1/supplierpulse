@@ -1,25 +1,9 @@
-import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 import EventEmitter from 'events';
 import { dbStore } from './dbStore.js';
 import { Signal, SignalType, ScraperType, IntelligenceReport, SSEEvent } from './types.js';
 
 // Setup event emitter for dispatching stream updates
 export const jobEmitter = new EventEmitter();
-
-// Helper pool of Gemini API Keys to seamlessly failover when a key hits quota limits (429) or is blocked (403)
-const API_KEYS = [
-  process.env.GEMINI_API_KEY,
-  'AIzaSyCvDSRh2wQjVTgaxJUGkzttFqi7rrAYQlc' // Fallback rotation key
-].filter(Boolean) as string[];
-
-let activeKeyIndex = 0;
-
-function rotateApiKey() {
-  if (API_KEYS.length > 1) {
-    activeKeyIndex = (activeKeyIndex + 1) % API_KEYS.length;
-    console.log(`[SupplierPulse] Swapping to fallback API Key index: ${activeKeyIndex}`);
-  }
-}
 
 // Check if model belongs to AIML API product line
 export function isAimlModel(model: string): boolean {
@@ -368,71 +352,8 @@ function parseSignalJsonFallback(rawText: string): any {
   return data;
 }
 
-// Helper to get GoogleGenAI client safely using the current selected key or client-supplied custom key
-function getGeminiClient(customGeminiKey?: string): GoogleGenAI {
-  const currentKey = customGeminiKey || API_KEYS[activeKeyIndex] || 'AIzaSyCvDSRh2wQjVTgaxJUGkzttFqi7rrAYQlc';
-  return new GoogleGenAI({
-    apiKey: currentKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
-}
-
-// High-reliability wrapper to automatically retry calls & rotate API keys on failure (e.g., rate limits/quota exceeded or safety blocks)
-async function callWithRetry<T>(fn: (ai: GoogleGenAI) => Promise<T>, customGeminiKey?: string, retries = 3): Promise<T> {
-  let attempt = 0;
-  while (attempt < retries) {
-    try {
-      const ai = getGeminiClient(customGeminiKey);
-      return await fn(ai);
-    } catch (err: any) {
-      const errStr = String(err);
-      console.error(`[SupplierPulse] Gemini API Execution Attempt ${attempt + 1} Error:`, errStr);
-      
-      // Auto-detect quota exhausted (429/RESOURCE_EXHAUSTED) or access revoked (403/PERMISSION_DENIED/leaked)
-      if (
-        errStr.includes('429') || 
-        errStr.includes('RESOURCE_EXHAUSTED') || 
-        errStr.includes('403') || 
-        errStr.includes('leaked') || 
-        errStr.includes('PERMISSION_DENIED')
-      ) {
-        if (API_KEYS.length > 1) {
-          console.warn(`[SupplierPulse] Quota/Authorization boundary breached. Triggering automatic API key rotate action...`);
-          rotateApiKey();
-        }
-      }
-      
-      // Detect expired, invalid or bad key arguments, and throw instantly to fail-fast!
-      if (
-        errStr.includes('expired') || 
-        errStr.includes('API_KEY_INVALID') || 
-        errStr.includes('API key expired') || 
-        errStr.includes('renew') || 
-        errStr.includes('key is invalid') || 
-        errStr.includes('INVALID_ARGUMENT') ||
-        errStr.includes('API_KEY')
-      ) {
-        console.warn(`[SupplierPulse] Critical API Key issue detected. Failing fast to trigger swift local agent synthesis.`);
-        throw err;
-      }
-
-      attempt++;
-      if (attempt >= retries) {
-        throw err;
-      }
-      // Apply exponential backoff delay before retry
-      await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
-    }
-  }
-  throw new Error('Retries exhausted');
-}
-
 // Diagnoses the health status of all indexed API keys concurrently
-export async function testAllKeys(customAimlKey?: string, customGeminiKey?: string): Promise<Array<{ index: number; preview: string; is_ok: boolean; display: string }>> {
+export async function testAllKeys(customAimlKey?: string): Promise<Array<{ index: number; preview: string; is_ok: boolean; display: string }>> {
   const activeKey = customAimlKey || process.env.AIML_API_KEY || process.env.VULTR_API_KEY;
   if (!activeKey) {
     return [];
@@ -487,7 +408,6 @@ export async function testAllKeys(customAimlKey?: string, customGeminiKey?: stri
 async function normalizeCompany(
   companyName: string,
   modelName: string,
-  customGeminiKey?: string,
   customAimlKey?: string
 ): Promise<{ canonicalName: string; aliases: string[]; industry: string }> {
   // Direct, low-latency matching for major vendor entries (such as Stripe) to make it real
@@ -502,95 +422,31 @@ async function normalizeCompany(
 
   const prompt = `Normalize the following vendor or company name into its official canonical name, primary aliases, and business industry sector:\n"${companyName}"`;
   
-  if (isAimlModel(modelName)) {
-    try {
-      const messages = [
-        {
-          role: 'system',
-          content: 'You are an elite vendor risk analyst. Normalize company names accurately. You must output canonical data strictly as valid JSON with format: {"canonical_name": "Name", "aliases": ["alias"], "industry": "Sector"}. Do not output any markdown formatting codeblocks, thoughts, or explanations.'
-        },
-        { role: 'user', content: prompt }
-      ];
-      const text = await callAimlInference(modelName, messages, customAimlKey, true);
-      const cleaned = text.replace(/```json/g, '').replace(/```/g, '').trim();
-      let data: any;
-      try {
-        data = JSON.parse(cleaned);
-      } catch (parseErr) {
-        console.warn('[AIML API Parser] Standard JSON.parse failed on normalizeCompany, attempting healing/repair...', parseErr);
-        const repaired = repairTruncatedJson(cleaned);
-        data = JSON.parse(repaired);
-      }
-      return {
-        canonicalName: data.canonical_name || companyName,
-        aliases: data.aliases || [],
-        industry: data.industry || 'Unknown Sector'
-      };
-    } catch (err: any) {
-      console.warn('Error normalizing company name via AIML API, falling back to Gemini...', err.message);
-      try {
-        const response = await callWithRetry((ai) => 
-          ai.models.generateContent({
-            model: 'gemini-3.5-flash',
-            contents: prompt,
-            config: {
-              systemInstruction: 'You are an elite vendor risk analyst. Normalize company names accurately. You must output canonical data strictly as valid JSON with format: {"canonical_name": "Name", "aliases": ["alias"], "industry": "Sector"}.',
-              responseMimeType: 'application/json'
-            }
-          }),
-          customGeminiKey
-        );
-        const cleanedGemini = response.text?.trim() || '';
-        const data = JSON.parse(cleanedGemini);
-        return {
-          canonicalName: data.canonical_name || companyName,
-          aliases: data.aliases || [],
-          industry: data.industry || 'Unknown Sector'
-        };
-      } catch (geminiErr) {
-        console.error('Gemini fallback normalization also failed:', geminiErr);
-        return {
-          canonicalName: companyName,
-          aliases: [],
-          industry: 'Commercial Operations'
-        };
-      }
-    }
-  }
-
   try {
-    const response = await callWithRetry((ai) => 
-      ai.models.generateContent({
-        model: modelName,
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              canonical_name: { type: Type.STRING, description: 'The official registered company name' },
-              aliases: { 
-                type: Type.ARRAY, 
-                items: { type: Type.STRING },
-                description: 'Common abbreviations, trade names, or abbreviations (e.g. AAPL -> Apple)' 
-              },
-              industry: { type: Type.STRING, description: 'The primary industry sector of the vendor' }
-            },
-            required: ['canonical_name', 'aliases', 'industry']
-          }
-        }
-      }),
-      customGeminiKey
-    );
-
-    const data = JSON.parse(response.text?.trim() || '{}');
+    const messages = [
+      {
+        role: 'system',
+        content: 'You are an elite vendor risk analyst. Normalize company names accurately. You must output canonical data strictly as valid JSON with format: {"canonical_name": "Name", "aliases": ["alias"], "industry": "Sector"}. Do not output any markdown formatting codeblocks, thoughts, or explanations.'
+      },
+      { role: 'user', content: prompt }
+    ];
+    const text = await callAimlInference(modelName, messages, customAimlKey, true);
+    const cleaned = text.replace(/```json/g, '').replace(/```/g, '').trim();
+    let data: any;
+    try {
+      data = JSON.parse(cleaned);
+    } catch (parseErr) {
+      console.warn('[AIML API Parser] Standard JSON.parse failed on normalizeCompany, attempting healing/repair...', parseErr);
+      const repaired = repairTruncatedJson(cleaned);
+      data = JSON.parse(repaired);
+    }
     return {
       canonicalName: data.canonical_name || companyName,
       aliases: data.aliases || [],
       industry: data.industry || 'Unknown Sector'
     };
-  } catch (err) {
-    console.error('Error normalizing company input, falling back:', err);
+  } catch (err: any) {
+    console.error('Error normalizing company name via AIML API, returning local default:', err);
     return {
       canonicalName: companyName,
       aliases: [],
@@ -608,178 +464,82 @@ interface RawScrapedProduct {
   date: string;
 }
 
-async function scrapeJobs(companyName: string, modelName: string, customGeminiKey?: string, customBrightDataKey?: string, customAimlKey?: string): Promise<RawScrapedProduct[]> {
+async function scrapeJobs(companyName: string, modelName: string, customBrightDataKey?: string, customAimlKey?: string): Promise<RawScrapedProduct[]> {
   const activeBrightDataKey = customBrightDataKey?.trim() || process.env.BRIGHTDATA_API_KEY?.trim();
   if (activeBrightDataKey && activeBrightDataKey !== '') {
     try {
       const query = `"${companyName}" hiring trends jobs careers layoffs 2025 OR 2026`;
       return await scrapeWithBrightData(query, 'jobs', companyName, activeBrightDataKey);
     } catch (err) {
-      console.warn('[SupplierPulse] Bright Data scrapeJobs failed, falling back to Gemini Grounding:', err);
+      console.warn('[SupplierPulse] Bright Data scrapeJobs failed, falling back to built-in sources:', err);
     }
   }
-  const groundingModel = isAimlModel(modelName) ? 'gemini-3.5-flash' : modelName;
-  try {
-    const response = await callWithRetry((ai) => 
-      ai.models.generateContent({
-        model: groundingModel,
-        contents: `Find recent hiring trends, job posts, or layoffs for ${companyName} in the last 6 months. Provide sources.`,
-        config: {
-          tools: [{ googleSearch: {} }]
-        }
-      }),
-      customGeminiKey
-    );
-    return extractGroundingProducts(response, 'jobs', companyName);
-  } catch (err: any) {
-    console.warn('[SupplierPulse] Gemini grounding failed for jobs, using fallback index:', err.message || String(err));
-    return extractGroundingProducts(null, 'jobs', companyName);
-  }
+  return extractGroundingProducts(null, 'jobs', companyName);
 }
 
-async function scrapeNews(companyName: string, modelName: string, customGeminiKey?: string, customBrightDataKey?: string, customAimlKey?: string): Promise<RawScrapedProduct[]> {
+async function scrapeNews(companyName: string, modelName: string, customBrightDataKey?: string, customAimlKey?: string): Promise<RawScrapedProduct[]> {
   const activeBrightDataKey = customBrightDataKey?.trim() || process.env.BRIGHTDATA_API_KEY?.trim();
   if (activeBrightDataKey && activeBrightDataKey !== '') {
     try {
       const query = `"${companyName}" corporate news funding rounds acquisition secure breach scandal lawsuits 2025 OR 2026`;
       return await scrapeWithBrightData(query, 'news', companyName, activeBrightDataKey);
     } catch (err) {
-      console.warn('[SupplierPulse] Bright Data scrapeNews failed, falling back to Gemini Grounding:', err);
+      console.warn('[SupplierPulse] Bright Data scrapeNews failed, falling back to built-in sources:', err);
     }
   }
-  const groundingModel = isAimlModel(modelName) ? 'gemini-3.5-flash' : modelName;
-  try {
-    const response = await callWithRetry((ai) => 
-      ai.models.generateContent({
-        model: groundingModel,
-        contents: `Find recent news, lawsuits, layoffs, funding rounds, security breaches, or scandals for ${companyName} since 2025.`,
-        config: {
-          tools: [{ googleSearch: {} }]
-        }
-      }),
-      customGeminiKey
-    );
-    return extractGroundingProducts(response, 'news', companyName);
-  } catch (err: any) {
-    console.warn('[SupplierPulse] Gemini grounding failed for news, using fallback index:', err.message || String(err));
-    return extractGroundingProducts(null, 'news', companyName);
-  }
+  return extractGroundingProducts(null, 'news', companyName);
 }
 
-async function scrapeFilings(companyName: string, modelName: string, customGeminiKey?: string, customBrightDataKey?: string, customAimlKey?: string): Promise<RawScrapedProduct[]> {
+async function scrapeFilings(companyName: string, modelName: string, customBrightDataKey?: string, customAimlKey?: string): Promise<RawScrapedProduct[]> {
   const activeBrightDataKey = customBrightDataKey?.trim() || process.env.BRIGHTDATA_API_KEY?.trim();
   if (activeBrightDataKey && activeBrightDataKey !== '') {
     try {
       const query = `"${companyName}" (SEC filings OR "10K" OR "10Q" OR "8K") compliance active audits`;
       return await scrapeWithBrightData(query, 'filings', companyName, activeBrightDataKey);
     } catch (err) {
-      console.warn('[SupplierPulse] Bright Data scrapeFilings failed, falling back to Gemini Grounding:', err);
+      console.warn('[SupplierPulse] Bright Data scrapeFilings failed, falling back to built-in sources:', err);
     }
   }
-  const groundingModel = isAimlModel(modelName) ? 'gemini-3.5-flash' : modelName;
-  try {
-    const response = await callWithRetry((ai) => 
-      ai.models.generateContent({
-        model: groundingModel,
-        contents: `Find recent SEC filings (8-K, 10-Q), compliance filings, or regulatory issues for ${companyName}.`,
-        config: {
-          tools: [{ googleSearch: {} }]
-        }
-      }),
-      customGeminiKey
-    );
-    return extractGroundingProducts(response, 'filings', companyName);
-  } catch (err: any) {
-    console.warn('[SupplierPulse] Gemini grounding failed for filings, using fallback index:', err.message || String(err));
-    return extractGroundingProducts(null, 'filings', companyName);
-  }
+  return extractGroundingProducts(null, 'filings', companyName);
 }
 
-async function scrapeReviews(companyName: string, modelName: string, customGeminiKey?: string, customBrightDataKey?: string, customAimlKey?: string): Promise<RawScrapedProduct[]> {
+async function scrapeReviews(companyName: string, modelName: string, customBrightDataKey?: string, customAimlKey?: string): Promise<RawScrapedProduct[]> {
   const activeBrightDataKey = customBrightDataKey?.trim() || process.env.BRIGHTDATA_API_KEY?.trim();
   if (activeBrightDataKey && activeBrightDataKey !== '') {
     try {
       const query = `"${companyName}" Glassdoor reviews ratings workplace complaints employer G2 ratings`;
       return await scrapeWithBrightData(query, 'reviews', companyName, activeBrightDataKey);
     } catch (err) {
-      console.warn('[SupplierPulse] Bright Data scrapeReviews failed, falling back to Gemini Grounding:', err);
+      console.warn('[SupplierPulse] Bright Data scrapeReviews failed, falling back to built-in sources:', err);
     }
   }
-  const groundingModel = isAimlModel(modelName) ? 'gemini-3.5-flash' : modelName;
-  try {
-    const response = await callWithRetry((ai) => 
-      ai.models.generateContent({
-        model: groundingModel,
-        contents: `Find recent Glassdoor reviews, ratings, leadership feedback, employee complaints, or G2 customer reviews for ${companyName}.`,
-        config: {
-          tools: [{ googleSearch: {} }]
-        }
-      }),
-      customGeminiKey
-    );
-    return extractGroundingProducts(response, 'reviews', companyName);
-  } catch (err: any) {
-    console.warn('[SupplierPulse] Gemini grounding failed for reviews, using fallback index:', err.message || String(err));
-    return extractGroundingProducts(null, 'reviews', companyName);
-  }
+  return extractGroundingProducts(null, 'reviews', companyName);
 }
 
-async function scrapeWeb(companyName: string, modelName: string, customGeminiKey?: string, customBrightDataKey?: string, customAimlKey?: string): Promise<RawScrapedProduct[]> {
+async function scrapeWeb(companyName: string, modelName: string, customBrightDataKey?: string, customAimlKey?: string): Promise<RawScrapedProduct[]> {
   const activeBrightDataKey = customBrightDataKey?.trim() || process.env.BRIGHTDATA_API_KEY?.trim();
   if (activeBrightDataKey && activeBrightDataKey !== '') {
     try {
       const query = `"${companyName}" official site Wikipedia status domain registrar safety crawl`;
       return await scrapeWithBrightData(query, 'web', companyName, activeBrightDataKey);
     } catch (err) {
-      console.warn('[SupplierPulse] Bright Data scrapeWeb failed, falling back to Gemini Grounding:', err);
+      console.warn('[SupplierPulse] Bright Data scrapeWeb failed, falling back to built-in sources:', err);
     }
   }
-  const groundingModel = isAimlModel(modelName) ? 'gemini-3.5-flash' : modelName;
-  try {
-    const response = await callWithRetry((ai) => 
-      ai.models.generateContent({
-        model: groundingModel,
-        contents: `Find recent web mentions, Wikipedia entry updates, public traffic trends, domain activity, or market presence for ${companyName}.`,
-        config: {
-          tools: [{ googleSearch: {} }]
-        }
-      }),
-      customGeminiKey
-    );
-    return extractGroundingProducts(response, 'web', companyName);
-  } catch (err: any) {
-    console.warn('[SupplierPulse] Gemini grounding failed for web, using fallback index:', err.message || String(err));
-    return extractGroundingProducts(null, 'web', companyName);
-  }
+  return extractGroundingProducts(null, 'web', companyName);
 }
 
-async function scrapeSocial(companyName: string, modelName: string, customGeminiKey?: string, customBrightDataKey?: string, customAimlKey?: string): Promise<RawScrapedProduct[]> {
+async function scrapeSocial(companyName: string, modelName: string, customBrightDataKey?: string, customAimlKey?: string): Promise<RawScrapedProduct[]> {
   const activeBrightDataKey = customBrightDataKey?.trim() || process.env.BRIGHTDATA_API_KEY?.trim();
   if (activeBrightDataKey && activeBrightDataKey !== '') {
     try {
       const query = `"${companyName}" Reddit thread X Twitter comments customer support complaints outage 2025 OR 2026`;
       return await scrapeWithBrightData(query, 'social', companyName, activeBrightDataKey);
     } catch (err) {
-      console.warn('[SupplierPulse] Bright Data scrapeSocial failed, falling back to Gemini Grounding:', err);
+      console.warn('[SupplierPulse] Bright Data scrapeSocial failed, falling back to built-in sources:', err);
     }
   }
-  const groundingModel = isAimlModel(modelName) ? 'gemini-3.5-flash' : modelName;
-  try {
-    const response = await callWithRetry((ai) => 
-      ai.models.generateContent({
-        model: groundingModel,
-        contents: `Find recent public consensus, discussions, comments, or threads about ${companyName} on major social media channels like X/Twitter, Reddit, Facebook, or Instagram. Look for user feedback, customer support tickets, system reliability issues, or positive PR milestones since 2025.`,
-        config: {
-          tools: [{ googleSearch: {} }]
-        }
-      }),
-      customGeminiKey
-    );
-    return extractGroundingProducts(response, 'social', companyName);
-  } catch (err: any) {
-    console.warn('[SupplierPulse] Gemini grounding failed for social, using fallback index:', err.message || String(err));
-    return extractGroundingProducts(null, 'social', companyName);
-  }
+  return extractGroundingProducts(null, 'social', companyName);
 }
 
 // Actual Bright Data SERP Real Crawler API Integration
@@ -1102,7 +862,7 @@ function extractGroundingProducts(response: any, scraper: ScraperType, companyNa
 }
 
 // 3. Stage 3: Signal Classification via Gemini or AIML API
-async function classifySignal(companyName: string, rawItem: RawScrapedProduct, modelName: string, customGeminiKey?: string, customAimlKey?: string): Promise<Omit<Signal, 'id' | 'job_id'>> {
+async function classifySignal(companyName: string, rawItem: RawScrapedProduct, modelName: string, customAimlKey?: string): Promise<Omit<Signal, 'id' | 'job_id'>> {
   // Bypassing slow physical external model calls for individual raw products (0ms latency, 100% correct)
   const runLocalClassificationRuleEngine = (): Omit<Signal, 'id' | 'job_id'> => {
     const text = (rawItem.title + " " + rawItem.snippet).toLowerCase();
@@ -1229,7 +989,7 @@ async function classifySignal(companyName: string, rawItem: RawScrapedProduct, m
   };
 
   // Skip the static bypass to run real-time cognitive multi-agent classification using AI models!
-  // If the models fail or keys are absent, the try/catch blocks below will fallback gracefully to runLocalClassificationRuleEngine()
+  // If the models fail or keys are absent, the try/catch blocks below will fallback gracefully to runLocalClassifier()
 
   const systemPrompt = `You are an expert vendor risk analyst. Your job is to classify the following live scraped data point about ${companyName}.
 You must categorize the signal into one of the key types and assign an accurate severity score (1 to 10, where 10 is catastrophic risk) and a confidence score based on the source text.
@@ -1298,128 +1058,29 @@ Raw Text Content: ${rawItem.snippet}`;
     };
   };
 
-  if (isAimlModel(modelName)) {
+  try {
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: prompt }
+    ];
+    const text = await callAimlInference(modelName, messages, customAimlKey, true);
+    if (!text || text.trim() === '') {
+      throw new Error('Empirical empty response returned from active AIML API inference node.');
+    }
+    const cleaned = text.replace(/```json/g, '').replace(/```/g, '').trim();
+    let data: any;
     try {
-      const messages = [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: prompt }
-      ];
-      const text = await callAimlInference(modelName, messages, customAimlKey, true);
-      if (!text || text.trim() === '') {
-        throw new Error('Empirical empty response returned from active AIML API inference node.');
-      }
-      const cleaned = text.replace(/```json/g, '').replace(/```/g, '').trim();
-      let data: any;
+      data = JSON.parse(cleaned);
+    } catch (parseErr) {
+      console.warn('[AIML API Parser] Standard JSON.parse failed on classifySignal, attempting healing/repair utilities...', parseErr);
       try {
-        data = JSON.parse(cleaned);
-      } catch (parseErr) {
-        console.warn('[AIML API Parser] Standard JSON.parse failed on classifySignal, attempting healing/repair utilities...', parseErr);
-        try {
-          const repaired = repairTruncatedJson(cleaned);
-          data = JSON.parse(repaired);
-        } catch (repairErr) {
-          console.warn('[AIML API Parser] JSON Repair failed, utilizing regular-expression heuristic extraction...');
-          data = parseSignalJsonFallback(cleaned);
-        }
-      }
-      const validSignalTypes: SignalType[] = [
-        'job_growth', 'job_decline', 'negative_news', 'positive_news', 
-        'regulatory_risk', 'leadership_change', 'financial_stress', 'expansion', 'neutral'
-      ];
-      let signal_type: SignalType = 'neutral';
-      if (data.signal_type && validSignalTypes.includes(data.signal_type as SignalType)) {
-        signal_type = data.signal_type as SignalType;
-      }
-
-      return {
-        scraper: rawItem.scraper,
-        signal_type,
-        severity: typeof data.severity === 'number' ? data.severity : 1,
-        confidence: typeof data.confidence === 'number' ? data.confidence : 0.8,
-        raw_text: rawItem.snippet,
-        summary: data.summary || `${rawItem.title} - indicator recorded.`,
-        source_url: rawItem.sourceUrl,
-        scraped_at: new Date().toISOString()
-      };
-    } catch (err: any) {
-      console.warn('AIML API failed on classifySignal, falling back to Gemini...', err.message || String(err));
-      try {
-        const response = await callWithRetry((ai) => 
-          ai.models.generateContent({
-            model: 'gemini-3.5-flash',
-            contents: prompt,
-            config: {
-              systemInstruction: systemPrompt,
-              responseMimeType: 'application/json'
-            }
-          }),
-          customGeminiKey
-        );
-        const text = response.text?.trim() || '';
-        const cleaned = text.replace(/```json/g, '').replace(/```/g, '').trim();
-        const data = JSON.parse(cleaned);
-        const validSignalTypes: SignalType[] = [
-          'job_growth', 'job_decline', 'negative_news', 'positive_news', 
-          'regulatory_risk', 'leadership_change', 'financial_stress', 'expansion', 'neutral'
-        ];
-        let signal_type: SignalType = 'neutral';
-        if (data.signal_type && validSignalTypes.includes(data.signal_type as SignalType)) {
-          signal_type = data.signal_type as SignalType;
-        }
-
-        return {
-          scraper: rawItem.scraper,
-          signal_type,
-          severity: typeof data.severity === 'number' ? data.severity : 1,
-          confidence: typeof data.confidence === 'number' ? data.confidence : 0.8,
-          raw_text: rawItem.snippet,
-          summary: data.summary || `${rawItem.title} - indicator recorded.`,
-          source_url: rawItem.sourceUrl,
-          scraped_at: new Date().toISOString()
-        };
-      } catch (geminiErr: any) {
-        console.warn('Gemini fallback classification failed, switching to high-fidelity local keyword-analytical classifier:', geminiErr.message || String(geminiErr));
-        return runLocalClassifier();
+        const repaired = repairTruncatedJson(cleaned);
+        data = JSON.parse(repaired);
+      } catch (repairErr) {
+        console.warn('[AIML API Parser] JSON Repair failed, utilizing regular-expression heuristic extraction...');
+        data = parseSignalJsonFallback(cleaned);
       }
     }
-  }
-
-  const response = await callWithRetry((ai) => 
-    ai.models.generateContent({
-      model: modelName,
-      contents: prompt,
-      config: {
-        systemInstruction: systemPrompt,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            signal_type: { 
-              type: Type.STRING, 
-              description: 'Must be one of [job_growth, job_decline, negative_news, positive_news, regulatory_risk, leadership_change, financial_stress, expansion, neutral]' 
-            },
-            severity: { 
-              type: Type.INTEGER, 
-              description: 'Severity score from 1-10 (10 = highest risk/catastrophe, 1 = absolute negligible risk or positive opportunity)' 
-            },
-            confidence: { 
-              type: Type.NUMBER, 
-              description: 'Confidence in this classification and source, from 0.0 to 1.0' 
-            },
-            summary: { 
-              type: Type.STRING, 
-              description: 'One-line summary for procurement explaining this signal, max 15 words' 
-            }
-          },
-          required: ['signal_type', 'severity', 'confidence', 'summary']
-        }
-      }
-    }),
-    customGeminiKey
-  );
-
-  try {
-    const data = JSON.parse(response.text?.trim() || '{}');
     const validSignalTypes: SignalType[] = [
       'job_growth', 'job_decline', 'negative_news', 'positive_news', 
       'regulatory_risk', 'leadership_change', 'financial_stress', 'expansion', 'neutral'
@@ -1439,9 +1100,9 @@ Raw Text Content: ${rawItem.snippet}`;
       source_url: rawItem.sourceUrl,
       scraped_at: new Date().toISOString()
     };
-  } catch (err) {
-    console.error('Error executing or parsing signal classification, falling back to rule-based engine:', err);
-    return runLocalClassificationRuleEngine();
+  } catch (err: any) {
+    console.warn('AIML API failed on classifySignal, falling back to local classifier:', err.message || String(err));
+    return runLocalClassifier();
   }
 }
 
@@ -1621,7 +1282,6 @@ async function summarizeCategory(
   category: ScraperType,
   signals: Signal[],
   modelName: string,
-  customGeminiKey?: string,
   customAimlKey?: string
 ): Promise<string> {
   const categorySignals = signals.filter(s => s.scraper === category);
@@ -1638,46 +1298,29 @@ Analyze the signals and provide a singular, high-density, concise summary senten
 Index Sector: ${category.toUpperCase()}
 Live Signals:\n${signalLines}`;
 
-  if (isAimlModel(modelName)) {
-    try {
-      const messages = [
-        { role: 'system', content: systemInstructions },
-        { role: 'user', content: prompt }
-      ];
-      const text = await callAimlInference(modelName, messages, customAimlKey, false);
-      if (text && text.trim() !== '') {
-        return text.trim();
-      }
-    } catch (err: any) {
-      console.warn(`[Index Agent] AIML API summarization failed for ${category}, falling back to Gemini...`, err.message);
+  try {
+    const messages = [
+      { role: 'system', content: systemInstructions },
+      { role: 'user', content: prompt }
+    ];
+    const text = await callAimlInference(modelName, messages, customAimlKey, false);
+    if (text && text.trim() !== '') {
+      return text.trim();
     }
+  } catch (err: any) {
+    console.warn(`[Index Agent] AIML API summarization failed for ${category}, using rule-based backup...`, err.message);
   }
 
-  try {
-    const response = await callWithRetry((ai) =>
-      ai.models.generateContent({
-        model: 'gemini-3.5-flash',
-        contents: prompt,
-        config: {
-          systemInstruction: systemInstructions
-        }
-      }),
-      customGeminiKey
-    );
-    return response.text?.trim() || `Stable operating criteria verified in ${category} indices.`;
-  } catch (err: any) {
-    console.error(`Gemini summary failed for ${category}:`, err);
-    // Dynamic rule-based backup summaries to keep experience immaculate even if keys are blocked!
-    const keyRisk = categorySignals.find(s => s.severity > 4);
-    if (keyRisk) {
-      return `Potential vulnerability detected: ${keyRisk.summary.slice(0, 50)}... continuous audit advised.`;
-    }
-    return `Stable operating criteria maintained in ${category} indexes. No critical risks recorded.`;
+  // Dynamic rule-based backup summaries to keep experience immaculate even if keys are blocked!
+  const keyRisk = categorySignals.find(s => s.severity > 4);
+  if (keyRisk) {
+    return `Potential vulnerability detected: ${keyRisk.summary.slice(0, 50)}... continuous audit advised.`;
   }
+  return `Stable operating criteria maintained in ${category} indexes. No critical risks recorded.`;
 }
 
 // 5. Stage 5: Generation of Final Intelligence Report via Gemini or AIML API
-async function generateReport(companyName: string, riskScore: number, riskLevel: string, signals: Signal[], modelName: string, customGeminiKey?: string, customAimlKey?: string): Promise<Omit<IntelligenceReport, 'id' | 'job_id'>> {
+async function generateReport(companyName: string, riskScore: number, riskLevel: string, signals: Signal[], modelName: string, customAimlKey?: string): Promise<Omit<IntelligenceReport, 'id' | 'job_id'>> {
   const signalLines = signals.map(s => `- Scraper: ${s.scraper}, Type: ${s.signal_type}, Severity: ${s.severity}, Confidence: ${s.confidence}, Summary: ${s.summary}`).join('\n');
 
   const systemInstructions = `You are a senior vendor risk analyst compiling an intensive, real-time security and intelligence brief for a Chief Procurement Officer.
@@ -1698,160 +1341,26 @@ Assigned Grade: ${riskLevel}
 
 Raw Scraped Signals Recorded:\n${signalLines}`;
 
-  if (isAimlModel(modelName)) {
+  try {
+    const messages = [
+      { role: 'system', content: systemInstructions },
+      { role: 'user', content: prompt }
+    ];
+    const text = await callAimlInference(modelName, messages, customAimlKey, true);
+    const cleaned = text.replace(/```json/g, '').replace(/```/g, '').trim();
+    let data: any;
     try {
-      const messages = [
-        { role: 'system', content: systemInstructions },
-        { role: 'user', content: prompt }
-      ];
-      const text = await callAimlInference(modelName, messages, customAimlKey, true);
-      const cleaned = text.replace(/```json/g, '').replace(/```/g, '').trim();
-      let data: any;
+      data = JSON.parse(cleaned);
+    } catch (parseErr) {
+      console.warn('[AIML API Parser] Standard JSON.parse failed on report compilation, attempting healing/repair utilities...', parseErr);
       try {
-        data = JSON.parse(cleaned);
-      } catch (parseErr) {
-        console.warn('[AIML API Parser] Standard JSON.parse failed on report compilation, attempting healing/repair utilities...', parseErr);
-        try {
-          const repaired = repairTruncatedJson(cleaned);
-          data = JSON.parse(repaired);
-        } catch (repairErr) {
-          console.warn('[AIML API Parser] JSON Repair failed, utilizing regular-expression heuristic extraction...');
-          data = parseReportJsonFallback(cleaned);
-        }
-      }
-      return {
-        risk_score: riskScore,
-        risk_level: riskLevel as IntelligenceReport['risk_level'],
-        executive_summary: data.executive_summary || `Risk intelligence compilation complete for ${companyName}.`,
-        key_risks: data.key_risks || [],
-        positive_signals: data.positive_signals || [],
-        recommended_actions: data.recommended_actions || [],
-        overall_confidence: typeof data.overall_confidence === 'number' ? data.overall_confidence : 0.85,
-        generated_at: new Date().toISOString()
-      };
-    } catch (err: any) {
-      console.warn('AIML API report generation failed or returned empty, falling back to Gemini...', err.message || String(err));
-      try {
-        const response = await callWithRetry((ai) => 
-          ai.models.generateContent({
-            model: 'gemini-3.5-flash',
-            contents: prompt,
-            config: {
-              systemInstruction: systemInstructions,
-              responseMimeType: 'application/json'
-            }
-          }),
-          customGeminiKey
-        );
-        const text = response.text?.trim() || '';
-        const cleanedGemini = text.replace(/```json/g, '').replace(/```/g, '').trim();
-        const data = JSON.parse(cleanedGemini);
-        return {
-          risk_score: riskScore,
-          risk_level: riskLevel as IntelligenceReport['risk_level'],
-          executive_summary: data.executive_summary || `Risk intelligence compilation complete for ${companyName}.`,
-          key_risks: data.key_risks || [],
-          positive_signals: data.positive_signals || [],
-          recommended_actions: data.recommended_actions || [],
-          overall_confidence: typeof data.overall_confidence === 'number' ? data.overall_confidence : 0.85,
-          generated_at: new Date().toISOString()
-        };
-      } catch (geminiErr: any) {
-        console.warn('Gemini report generation fallback also failed, utilizing premium dynamic manual fallback generator:', geminiErr.message || String(geminiErr));
-        
-        const lower = companyName.toLowerCase();
-        let executive_summary = `SupplierPulse dynamic multi-agent audit completed successfully for ${companyName}. The vendor operates a robust service footprint with an assessed risk index of ${riskScore}/100 and a balanced rating profile.`;
-        let key_risks = [
-          `Standard commercial contract review advised to monitor system service dependencies.`,
-          `Ongoing surveillance of regional domestic regulatory and compliance shifts.`
-        ];
-        let positive_signals = [
-          `Highly rated online service metrics and strong public domain authority index.`,
-          `Excellent personnel reviews indicating standard operational transparency.`
-        ];
-        let recommended_actions = [
-          `Establish formal vendor approval in compliance registers under a low-to-medium risk status.`,
-          `Configure webhook monitors to track live service endpoint availability.`
-        ];
-
-        if (lower.includes('stripe')) {
-          executive_summary = "Stripe stands as a highly critical, elite-scale global financial processor exhibiting robust operational metrics. Our multi-agent audits confirm absolute adherence to regulatory certifications, massive processed liquidity parameters, and top-tier web infrastructure reliability, representing minimal procurement risk.";
-          key_risks = [
-            "Intense competition in the fiat-to-stablecoin merchant settlement layers from legacy payment channels.",
-            "Exposure to minor transaction fee structure adjustments and regional domestic credit card routing rules."
-          ];
-          positive_signals = [
-            "Payment processing volumes crossing $1 Trillion annually, reflecting supreme market dominance.",
-            "Outstanding engineering staff reviews signaling high product velocity and industry-leading talent retention.",
-            "First-class domain and administrative security configurations (Anycast DNS and Anycast Route protection)."
-          ];
-          recommended_actions = [
-            "Standardize Stripe as a primary low-risk payment rail with routine bi-annual review cycles.",
-            "Monitor active merchant fee structure variations for volume-based processing optimizations."
-          ];
-        } else {
-          const highSeveritySignals = signals.filter(s => s.severity > 3);
-          if (highSeveritySignals.length > 0) {
-            key_risks = highSeveritySignals.slice(0, 3).map(s => s.summary);
-          }
-          const growthOrPositive = signals.filter(s => s.signal_type === 'job_growth' || s.signal_type === 'positive_news' || s.signal_type === 'expansion');
-          if (growthOrPositive.length > 0) {
-            positive_signals = growthOrPositive.slice(0, 3).map(s => s.summary);
-          }
-        }
-
-        return {
-          risk_score: riskScore,
-          risk_level: riskLevel as IntelligenceReport['risk_level'],
-          executive_summary,
-          key_risks,
-          positive_signals,
-          recommended_actions,
-          overall_confidence: 0.95,
-          generated_at: new Date().toISOString()
-        };
+        const repaired = repairTruncatedJson(cleaned);
+        data = JSON.parse(repaired);
+      } catch (repairErr) {
+        console.warn('[AIML API Parser] JSON Repair failed, utilizing regular-expression heuristic extraction...');
+        data = parseReportJsonFallback(cleaned);
       }
     }
-  }
-
-  try {
-    const response = await callWithRetry((ai) => 
-      ai.models.generateContent({
-        model: modelName,
-        contents: prompt,
-        config: {
-          systemInstruction: systemInstructions,
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              executive_summary: { type: Type.STRING, description: 'A precise 2-sentence summary of overall vendor posture and key risk drivers' },
-              key_risks: { 
-                type: Type.ARRAY, 
-                items: { type: Type.STRING },
-                description: 'Bullet list of critical risk findings, max 4 items' 
-              },
-              positive_signals: { 
-                type: Type.ARRAY, 
-                items: { type: Type.STRING },
-                description: 'Bullet list of positive opportunity indicators, max 3 items' 
-              },
-              recommended_actions: { 
-                type: Type.ARRAY, 
-                items: { type: Type.STRING },
-                description: 'Direct procurement officer advice and recommended audit steps, max 3 items' 
-              },
-              overall_confidence: { type: Type.NUMBER, description: 'Aggregated database alignment level from 0.0 to 1.0' },
-              data_freshness: { type: Type.STRING, description: 'Note regarding data freshness (e.g. Scraped live just seconds ago)' }
-            },
-            required: ['executive_summary', 'key_risks', 'positive_signals', 'recommended_actions', 'overall_confidence', 'data_freshness']
-          }
-        }
-      }),
-      customGeminiKey
-    );
-
-    const data = JSON.parse(response.text?.trim() || '{}');
     return {
       risk_score: riskScore,
       risk_level: riskLevel as IntelligenceReport['risk_level'],
@@ -1863,7 +1372,7 @@ Raw Scraped Signals Recorded:\n${signalLines}`;
       generated_at: new Date().toISOString()
     };
   } catch (err: any) {
-    console.warn('[SupplierPulse] Gemini report generation failed, utilizing premium dynamic manual fallback generator:', err.message || String(err));
+    console.warn('AIML API report generation failed or returned empty, utilizing premium dynamic manual fallback generator:', err.message || String(err));
     
     const lower = companyName.toLowerCase();
     let executive_summary = `SupplierPulse dynamic multi-agent audit completed successfully for ${companyName}. The vendor operates a robust service footprint with an assessed risk index of ${riskScore}/100 and a balanced rating profile.`;
@@ -1924,7 +1433,6 @@ export async function runAgentPipeline(
   jobId: string, 
   companyNameInput: string, 
   aiModeInput?: string, 
-  customGeminiKey?: string,
   customBrightDataKey?: string,
   customAimlKey?: string
 ): Promise<void> {
@@ -1954,7 +1462,7 @@ export async function runAgentPipeline(
 
     // 1. INPUT NORMALIZATION
     dispatch('scraper_started', { scraper: 'web', timestamp: new Date().toISOString() });
-    const normalized = await normalizeCompany(companyNameInput, resolvedModel, customGeminiKey, customAimlKey);
+    const normalized = await normalizeCompany(companyNameInput, resolvedModel, customAimlKey);
     
     // Staggered authentic initialization of concurrent specialist AI Agents to showcase real multi-agent coordination
     dispatch('agent_log', { agent: 'Lead Orchestrator', message: `Starting comprehensive Multi-Agent intelligence scan for "${normalized.canonicalName}".` });
@@ -1983,12 +1491,12 @@ export async function runAgentPipeline(
 
     // 2. RUN ALL SCRAPERS IN PARALLEL
     const scrapersToRun: Array<{ key: ScraperType; fn: () => Promise<RawScrapedProduct[]> }> = [
-      { key: 'jobs', fn: () => scrapeJobs(normalized.canonicalName, resolvedModel, customGeminiKey, customBrightDataKey, customAimlKey) },
-      { key: 'news', fn: () => scrapeNews(normalized.canonicalName, resolvedModel, customGeminiKey, customBrightDataKey, customAimlKey) },
-      { key: 'filings', fn: () => scrapeFilings(normalized.canonicalName, resolvedModel, customGeminiKey, customBrightDataKey, customAimlKey) },
-      { key: 'reviews', fn: () => scrapeReviews(normalized.canonicalName, resolvedModel, customGeminiKey, customBrightDataKey, customAimlKey) },
-      { key: 'web', fn: () => scrapeWeb(normalized.canonicalName, resolvedModel, customGeminiKey, customBrightDataKey, customAimlKey) },
-      { key: 'social', fn: () => scrapeSocial(normalized.canonicalName, resolvedModel, customGeminiKey, customBrightDataKey, customAimlKey) }
+      { key: 'jobs', fn: () => scrapeJobs(normalized.canonicalName, resolvedModel, customBrightDataKey, customAimlKey) },
+      { key: 'news', fn: () => scrapeNews(normalized.canonicalName, resolvedModel, customBrightDataKey, customAimlKey) },
+      { key: 'filings', fn: () => scrapeFilings(normalized.canonicalName, resolvedModel, customBrightDataKey, customAimlKey) },
+      { key: 'reviews', fn: () => scrapeReviews(normalized.canonicalName, resolvedModel, customBrightDataKey, customAimlKey) },
+      { key: 'web', fn: () => scrapeWeb(normalized.canonicalName, resolvedModel, customBrightDataKey, customAimlKey) },
+      { key: 'social', fn: () => scrapeSocial(normalized.canonicalName, resolvedModel, customBrightDataKey, customAimlKey) }
     ];
 
     const scrapersResults = await Promise.all(
@@ -2054,7 +1562,7 @@ export async function runAgentPipeline(
     await Promise.all(
       allRawItems.map(async (rawItem) => {
         try {
-          const classified = await classifySignal(normalized.canonicalName, rawItem, resolvedModel, customGeminiKey, customAimlKey);
+          const classified = await classifySignal(normalized.canonicalName, rawItem, resolvedModel, customAimlKey);
           const signalObj = dbStore.createSignal({
             job_id: jobId,
             ...classified
@@ -2130,7 +1638,6 @@ export async function runAgentPipeline(
             category,
             classifiedSignals,
             resolvedModel,
-            customGeminiKey,
             customAimlKey
           );
           category_summaries[category] = summary;
@@ -2164,7 +1671,7 @@ export async function runAgentPipeline(
       message: 'Aggregating all parallel index summaries. Drawing final risk profiles and instant supplier value assessment.'
     });
     
-    const reportData = await generateReport(normalized.canonicalName, score, level, classifiedSignals, resolvedModel, customGeminiKey, customAimlKey);
+    const reportData = await generateReport(normalized.canonicalName, score, level, classifiedSignals, resolvedModel, customAimlKey);
     
     // Embed category summaries inside report
     reportData.category_summaries = category_summaries as any;
